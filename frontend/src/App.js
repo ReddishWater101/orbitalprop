@@ -8,6 +8,7 @@ import Typography from '@mui/material/Typography';
 import Button from '@mui/material/Button';
 import CircularProgress from '@mui/material/CircularProgress';
 import Alert from '@mui/material/Alert';
+import SatelliteManager from './components/SatelliteManager';
 
 // Theme configuration
 const darkTheme = createTheme({
@@ -64,10 +65,10 @@ function App() {
         alignItems: 'center',
         justifyContent: 'center'
       }}>
-        <Container maxWidth="sm">
-          <Paper elevation={3} sx={{ p: 4, textAlign: 'center' }}>
+        <Container maxWidth="md">
+          <Paper elevation={3} sx={{ p: 4, mb: 4 }}>
             <Typography variant="h4" component="h1" gutterBottom>
-              Simple App
+              Orbital Propagation App
             </Typography>
             
             {loading ? (
@@ -108,6 +109,10 @@ function App() {
             >
               Refresh Status
             </Button>
+          </Paper>
+          
+          <Paper elevation={3} sx={{ p: 4 }}>
+            <SatelliteManager />
           </Paper>
         </Container>
       </Box>

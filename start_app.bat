@@ -1,6 +1,6 @@
 @echo off
 echo ====================================
-echo   Simple App Launcher
+echo   Orbital Propagation App Launcher
 echo ====================================
 echo.
 
