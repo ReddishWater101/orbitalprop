@@ -1,4 +1,6 @@
 flask==2.0.1
 flask-cors==3.0.10
 werkzeug==2.0.1
-python-dotenv==0.20.0 
+python-dotenv==0.20.0
+skyfield==1.51
+plotly==5.16.1 

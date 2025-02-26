@@ -1,7 +1,12 @@
 from flask import Flask, jsonify, send_from_directory, request, render_template_string
 from flask_cors import CORS
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+from skyfield.api import EarthSatellite, load, Topos
+import numpy as np
+import plotly
+import plotly.graph_objects as go
+import json
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -67,6 +72,279 @@ def delete_satellite(satellite_id):
     else:
         return jsonify({'error': f"Satellite with ID {satellite_id} not found"}), 404
 
+@app.route('/api/satellites/<int:satellite_id>/propagate', methods=['POST'])
+def propagate_satellite(satellite_id):
+    """Propagate satellite orbit using Skyfield"""
+    # Get propagation parameters from request
+    data = request.json
+    
+    if not data or 'start_time' not in data or 'end_time' not in data or 'step_size' not in data:
+        return jsonify({'error': 'Start time, end time, and step size are required'}), 400
+    
+    # Find the satellite by ID
+    satellite_data = None
+    for sat in satellites:
+        if sat['id'] == satellite_id:
+            satellite_data = sat
+            break
+    
+    if not satellite_data:
+        return jsonify({'error': f"Satellite with ID {satellite_id} not found"}), 404
+    
+    try:
+        # Parse start and end times
+        start_time = datetime.fromisoformat(data['start_time'])
+        end_time = datetime.fromisoformat(data['end_time'])
+        step_size = float(data['step_size'])  # In minutes
+        
+        # Load Skyfield time scale
+        ts = load.timescale()
+        
+        # Parse TLE data
+        tle_lines = satellite_data['tle'].strip().split('\n')
+        if len(tle_lines) != 2:
+            return jsonify({'error': 'Invalid TLE data format'}), 400
+        
+        # Create Skyfield satellite object
+        satellite = EarthSatellite(tle_lines[0], tle_lines[1], satellite_data['name'], ts)
+        
+        # Initialize lists for results
+        latitudes = []
+        longitudes = []
+        elevations = []
+        positions = []
+        velocities = []
+        times = []
+        
+        # Propagate orbit
+        current_time = start_time
+        while current_time <= end_time:
+            # Convert current time to Skyfield time
+            t = ts.utc(
+                current_time.year,
+                current_time.month,
+                current_time.day,
+                current_time.hour,
+                current_time.minute,
+                current_time.second
+            )
+            
+            # Get satellite position and velocity
+            geocentric = satellite.at(t)
+            subpoint = geocentric.subpoint()
+            
+            # Store results
+            latitudes.append(subpoint.latitude.degrees)
+            longitudes.append(subpoint.longitude.degrees)
+            elevations.append(subpoint.elevation.m)
+            
+            # Get position (x, y, z) in kilometers
+            position = geocentric.position.km
+            positions.append({
+                'x': float(position[0]),
+                'y': float(position[1]),
+                'z': float(position[2])
+            })
+            
+            # Get velocity in km/s
+            velocity = geocentric.velocity.km_per_s
+            velocities.append({
+                'x': float(velocity[0]),
+                'y': float(velocity[1]),
+                'z': float(velocity[2])
+            })
+            
+            times.append(current_time.isoformat())
+            
+            # Increment time by step size
+            current_time += timedelta(minutes=step_size)
+        
+        # Return propagation results
+        return jsonify({
+            'satellite_id': satellite_id,
+            'satellite_name': satellite_data['name'],
+            'propagation_data': {
+                'times': times,
+                'latitudes': latitudes,
+                'longitudes': longitudes,
+                'elevations': elevations,
+                'positions': positions,
+                'velocities': velocities
+            }
+        })
+    
+    except Exception as e:
+        return jsonify({'error': f"Propagation failed: {str(e)}"}), 500
+
+def plotly_map_plot(latitudes, longitudes, zoom=1, center=None):
+    """Create an interactive map with satellite ground track"""
+    if center is None:
+        # Default center at [0, 0] if not provided
+        center = [0, 0]
+    
+    # Handle international date line crossing by splitting the data into segments
+    lat_segments = []
+    lon_segments = []
+    current_lat_segment = []
+    current_lon_segment = []
+    
+    for i in range(len(longitudes)):
+        # Add point to current segment
+        current_lat_segment.append(latitudes[i])
+        current_lon_segment.append(longitudes[i])
+        
+        # Check if we need to start a new segment (international date line crossing)
+        if i < len(longitudes) - 1:
+            # If longitude difference is more than 180 degrees, we've crossed the date line
+            if abs(longitudes[i+1] - longitudes[i]) > 180:
+                # End current segment
+                lat_segments.append(current_lat_segment)
+                lon_segments.append(current_lon_segment)
+                # Start new segment
+                current_lat_segment = []
+                current_lon_segment = []
+    
+    # Add the final segment if it has points
+    if current_lat_segment:
+        lat_segments.append(current_lat_segment)
+        lon_segments.append(current_lon_segment)
+    
+    # Create a trace for each segment
+    traces = []
+    for i in range(len(lat_segments)):
+        traces.append(
+            go.Scattermapbox(
+                mode="markers+lines",
+                lon=lon_segments[i],
+                lat=lat_segments[i],
+                marker=dict(size=5, color="#EDB120"),
+                line=dict(width=2, color="#EDB120"),
+                showlegend=False,
+            )
+        )
+    
+    # Create the figure with all traces
+    fig = go.Figure(data=traces)
+    
+    # Update layout with mapbox configuration
+    fig.update_layout(
+        mapbox=dict(
+            style="white-bg",
+            layers=[
+                {
+                    "below": "traces",
+                    "sourcetype": "raster",
+                    "sourceattribution": "United States Geological Survey",
+                    "source": [
+                        "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"
+                    ]
+                }
+            ],
+            center=dict(
+                lon=center[0],
+                lat=center[1]
+            ),
+            zoom=zoom,
+            bearing=0,
+        ),
+        width=800,
+        height=700,
+        margin=dict(l=0, r=0, t=0, b=0),
+    )
+    
+    return fig
+
+@app.route('/api/satellites/<int:satellite_id>/ground-track', methods=['POST'])
+def generate_ground_track(satellite_id):
+    """Generate and return a ground track plot for a satellite after propagation"""
+    # Get propagation parameters from request
+    data = request.json
+    
+    if not data or 'start_time' not in data or 'end_time' not in data or 'step_size' not in data:
+        return jsonify({'error': 'Start time, end time, and step size are required'}), 400
+    
+    # Find the satellite by ID
+    satellite_data = None
+    for sat in satellites:
+        if sat['id'] == satellite_id:
+            satellite_data = sat
+            break
+    
+    if not satellite_data:
+        return jsonify({'error': f"Satellite with ID {satellite_id} not found"}), 404
+    
+    try:
+        # Parse start and end times
+        start_time = datetime.fromisoformat(data['start_time'])
+        end_time = datetime.fromisoformat(data['end_time'])
+        step_size = float(data['step_size'])  # In minutes
+        
+        # Load Skyfield time scale
+        ts = load.timescale()
+        
+        # Parse TLE data
+        tle_lines = satellite_data['tle'].strip().split('\n')
+        if len(tle_lines) != 2:
+            return jsonify({'error': 'Invalid TLE data format'}), 400
+        
+        # Create Skyfield satellite object
+        satellite = EarthSatellite(tle_lines[0], tle_lines[1], satellite_data['name'], ts)
+        
+        # Initialize lists for results
+        latitudes = []
+        longitudes = []
+        times = []
+        
+        # Propagate orbit
+        current_time = start_time
+        while current_time <= end_time:
+            # Convert current time to Skyfield time
+            t = ts.utc(
+                current_time.year,
+                current_time.month,
+                current_time.day,
+                current_time.hour,
+                current_time.minute,
+                current_time.second
+            )
+            
+            # Get satellite position
+            geocentric = satellite.at(t)
+            subpoint = geocentric.subpoint()
+            
+            # Store results
+            latitudes.append(float(subpoint.latitude.degrees))
+            longitudes.append(float(subpoint.longitude.degrees))
+            times.append(current_time.isoformat())
+            
+            # Increment time by step size
+            current_time += timedelta(minutes=step_size)
+        
+        # Calculate center point (average of all lat/long points)
+        center_lat = sum(latitudes) / len(latitudes)
+        center_lon = sum(longitudes) / len(longitudes)
+        
+        # Create the plot
+        fig = plotly_map_plot(latitudes, longitudes, zoom=2, center=[center_lon, center_lat])
+        
+        # Convert to JSON
+        plot_json = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+        
+        # Return both plot data and propagation data
+        return jsonify({
+            'satellite_id': satellite_id,
+            'satellite_name': satellite_data['name'],
+            'plot_data': plot_json,
+            'propagation_data': {
+                'times': times,
+                'latitudes': latitudes,
+                'longitudes': longitudes
+            }
+        })
+    
+    except Exception as e:
+        return jsonify({'error': f"Ground track generation failed: {str(e)}"}), 500
+
 # HTML template for the main page
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -75,6 +353,7 @@ HTML_TEMPLATE = """
     <title>Orbital Propagation App</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -163,6 +442,130 @@ HTML_TEMPLATE = """
         .delete-btn:hover {
             background-color: #d32f2f;
         }
+        .button-container {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .propagate-btn {
+            background-color: #69f0ae;
+            color: black;
+            margin-top: 10px;
+        }
+        
+        .propagate-btn:hover {
+            background-color: #4caf50;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0,0,0,0.8);
+        }
+        
+        .modal-content {
+            background-color: #1e1e1e;
+            margin: 15% auto;
+            padding: 20px;
+            border-radius: 8px;
+            width: 80%;
+            max-width: 600px;
+        }
+        
+        .close {
+            color: #aaa;
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        
+        .close:hover {
+            color: white;
+        }
+        
+        .form-row {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .form-row > div {
+            flex: 1;
+        }
+        
+        .results-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        
+        .results-table th {
+            background-color: #2d2d2d;
+            text-align: left;
+            padding: 8px;
+        }
+        
+        .results-table td {
+            padding: 8px;
+            border-bottom: 1px solid #333;
+        }
+        
+        .ground-track-btn {
+            background-color: #8e44ad;
+            color: white;
+            margin-left: 10px;
+        }
+        
+        .ground-track-btn:hover {
+            background-color: #6c3483;
+        }
+        
+        .plot-container {
+            width: 100%;
+            height: 700px;
+            margin-top: 20px;
+        }
+        
+        .ground-track-modal .modal-content {
+            width: 90%;
+            max-width: 900px;
+            margin: 5% auto;
+        }
+        
+        .modal-tabs {
+            display: flex;
+            border-bottom: 1px solid #333;
+            margin-bottom: 15px;
+        }
+        
+        .modal-tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            background-color: #2d2d2d;
+            margin-right: 5px;
+            border-radius: 5px 5px 0 0;
+        }
+        
+        .modal-tab.active {
+            background-color: #00b0ff;
+            color: white;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -203,9 +606,82 @@ HTML_TEMPLATE = """
             </div>
             <button onclick="fetchSatellites()">Refresh List</button>
         </div>
+        
+        <!-- Propagation Modal -->
+        <div id="propagation-modal" class="modal">
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('propagation-modal')">&times;</span>
+                <h2>Propagate Satellite Orbit</h2>
+                <div id="propagation-form">
+                    <div id="selected-satellite-name"></div>
+                    <div class="form-row">
+                        <div>
+                            <label for="start-time">Start Time:</label>
+                            <input type="datetime-local" id="start-time" required>
+                        </div>
+                        <div>
+                            <label for="end-time">End Time:</label>
+                            <input type="datetime-local" id="end-time" required>
+                        </div>
+                    </div>
+                    <div>
+                        <label for="step-size">Step Size (minutes):</label>
+                        <input type="number" id="step-size" value="0.2" min="0.1" step="0.1" required>
+                        <div class="help-text">Time interval between propagation points in minutes</div>
+                    </div>
+                    <div id="propagation-status"></div>
+                    <div style="display: flex; gap: 10px; margin-top: 15px;">
+                        <button onclick="propagateSatellite()" class="propagate-btn">Propagate</button>
+                        <button onclick="generateGroundTrack()" class="ground-track-btn">Propagate with Ground Track</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Results Modal -->
+        <div id="results-modal" class="modal">
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('results-modal')">&times;</span>
+                <h2>Propagation Results</h2>
+                <div id="results-container">
+                    <!-- Results will be displayed here -->
+                </div>
+            </div>
+        </div>
+        
+        <!-- Ground Track Modal -->
+        <div id="ground-track-modal" class="modal ground-track-modal">
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('ground-track-modal')">&times;</span>
+                <h2>Ground Track Visualization</h2>
+                
+                <div class="modal-tabs">
+                    <div class="modal-tab active" onclick="switchTab('map-tab')">Map View</div>
+                    <div class="modal-tab" onclick="switchTab('data-tab')">Data View</div>
+                </div>
+                
+                <div id="map-tab" class="tab-content active">
+                    <div id="ground-track-container" class="plot-container">
+                        <!-- Ground track map will be displayed here -->
+                    </div>
+                </div>
+                
+                <div id="data-tab" class="tab-content">
+                    <div id="ground-track-data">
+                        <!-- Ground track data will be displayed here -->
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
+        // Global variables for propagation
+        let selectedSatelliteId = null;
+        let selectedSatelliteName = null;
+        let propagationResults = null;
+        let groundTrackResults = null;
+        
         // Function to check the health of the backend
         function checkHealth() {
             document.getElementById('status').innerHTML = 'Checking connection...';
@@ -248,7 +724,10 @@ HTML_TEMPLATE = """
                                     <div><strong>TLE Data:</strong></div>
                                     <div class="tle-data">${satellite.tle}</div>
                                     <div style="color: #888;">Added: ${new Date(satellite.created_at).toLocaleString()}</div>
-                                    <button class="delete-btn" onclick="deleteSatellite(${satellite.id})">Delete Satellite</button>
+                                    <div class="button-container">
+                                        <button class="delete-btn" onclick="deleteSatellite(${satellite.id})">Delete Satellite</button>
+                                        <button class="propagate-btn" onclick="openPropagationModal(${satellite.id}, '${satellite.name}')">Propagate Orbit</button>
+                                    </div>
                                 </li>
                             `;
                         });
@@ -322,6 +801,233 @@ HTML_TEMPLATE = """
             .catch(error => {
                 alert(`Error: ${error.message}`);
             });
+        }
+
+        // Function to open propagation modal
+        function openPropagationModal(satelliteId, satelliteName) {
+            selectedSatelliteId = satelliteId;
+            selectedSatelliteName = satelliteName;
+            
+            // Set default times (now to 24 hours from now)
+            const now = new Date();
+            const tomorrow = new Date(now);
+            tomorrow.setHours(tomorrow.getHours() + 24);
+            
+            document.getElementById('selected-satellite-name').innerHTML = `<h3>Satellite: ${satelliteName}</h3>`;
+            document.getElementById('start-time').value = now.toISOString().slice(0, 16);
+            document.getElementById('end-time').value = tomorrow.toISOString().slice(0, 16);
+            document.getElementById('step-size').value = '0.2';
+            document.getElementById('propagation-status').innerHTML = '';
+            
+            document.getElementById('propagation-modal').style.display = 'block';
+        }
+        
+        // Function to close modals
+        function closeModal(modalId) {
+            document.getElementById(modalId).style.display = 'none';
+        }
+        
+        // Function to propagate satellite
+        function propagateSatellite() {
+            const startTime = document.getElementById('start-time').value;
+            const endTime = document.getElementById('end-time').value;
+            const stepSize = document.getElementById('step-size').value;
+            const statusElement = document.getElementById('propagation-status');
+            
+            if (!startTime || !endTime || !stepSize) {
+                statusElement.innerHTML = '<div class="error">All fields are required</div>';
+                return;
+            }
+            
+            statusElement.innerHTML = '<div>Propagating orbit...</div>';
+            
+            fetch(`/api/satellites/${selectedSatelliteId}/propagate`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    start_time: startTime,
+                    end_time: endTime,
+                    step_size: parseFloat(stepSize)
+                }),
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(err => { throw new Error(err.error || 'Failed to propagate orbit'); });
+                }
+                return response.json();
+            })
+            .then(data => {
+                propagationResults = data;
+                closeModal('propagation-modal');
+                displayResults();
+            })
+            .catch(error => {
+                statusElement.innerHTML = `<div class="error">Error: ${error.message}</div>`;
+            });
+        }
+        
+        // Function to generate ground track
+        function generateGroundTrack() {
+            const startTime = document.getElementById('start-time').value;
+            const endTime = document.getElementById('end-time').value;
+            const stepSize = document.getElementById('step-size').value;
+            const statusElement = document.getElementById('propagation-status');
+            
+            if (!startTime || !endTime || !stepSize) {
+                statusElement.innerHTML = '<div class="error">All fields are required</div>';
+                return;
+            }
+            
+            statusElement.innerHTML = '<div>Generating ground track...</div>';
+            
+            fetch(`/api/satellites/${selectedSatelliteId}/ground-track`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    start_time: startTime,
+                    end_time: endTime,
+                    step_size: parseFloat(stepSize)
+                }),
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(err => { throw new Error(err.error || 'Failed to generate ground track'); });
+                }
+                return response.json();
+            })
+            .then(data => {
+                groundTrackResults = data;
+                closeModal('propagation-modal');
+                displayGroundTrack();
+            })
+            .catch(error => {
+                statusElement.innerHTML = `<div class="error">Error: ${error.message}</div>`;
+            });
+        }
+        
+        // Function to display propagation results
+        function displayResults() {
+            const resultsContainer = document.getElementById('results-container');
+            
+            let html = `
+                <h3>${propagationResults.satellite_name}</h3>
+                <h4>Propagation Summary</h4>
+                <p>Total points: ${propagationResults.propagation_data.times.length}</p>
+                <p>Start time: ${new Date(propagationResults.propagation_data.times[0]).toLocaleString()}</p>
+                <p>End time: ${new Date(propagationResults.propagation_data.times[propagationResults.propagation_data.times.length - 1]).toLocaleString()}</p>
+                
+                <h4>Position and Velocity Data (First 5 points)</h4>
+                <table class="results-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Latitude (°)</th>
+                            <th>Longitude (°)</th>
+                            <th>Elevation (m)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            
+            // Add first 5 rows of data
+            const maxRows = Math.min(5, propagationResults.propagation_data.times.length);
+            for (let i = 0; i < maxRows; i++) {
+                html += `
+                    <tr>
+                        <td>${new Date(propagationResults.propagation_data.times[i]).toLocaleString()}</td>
+                        <td>${propagationResults.propagation_data.latitudes[i].toFixed(4)}</td>
+                        <td>${propagationResults.propagation_data.longitudes[i].toFixed(4)}</td>
+                        <td>${propagationResults.propagation_data.elevations[i].toFixed(2)}</td>
+                    </tr>
+                `;
+            }
+            
+            html += `
+                    </tbody>
+                </table>
+                <div style="margin-top: 15px; color: #69f0ae;">
+                    The complete propagation data can be analyzed and visualized using appropriate tools.
+                </div>
+            `;
+            
+            resultsContainer.innerHTML = html;
+            document.getElementById('results-modal').style.display = 'block';
+        }
+        
+        // Function to display ground track
+        function displayGroundTrack() {
+            // Display the map
+            const plotData = JSON.parse(groundTrackResults.plot_data);
+            Plotly.newPlot('ground-track-container', plotData.data, plotData.layout);
+            
+            // Display data in the data tab
+            const dataContainer = document.getElementById('ground-track-data');
+            
+            let html = `
+                <h3>${groundTrackResults.satellite_name}</h3>
+                <h4>Ground Track Summary</h4>
+                <p>Total points: ${groundTrackResults.propagation_data.times.length}</p>
+                <p>Start time: ${new Date(groundTrackResults.propagation_data.times[0]).toLocaleString()}</p>
+                <p>End time: ${new Date(groundTrackResults.propagation_data.times[groundTrackResults.propagation_data.times.length - 1]).toLocaleString()}</p>
+                
+                <h4>Ground Track Data</h4>
+                <table class="results-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Latitude (°)</th>
+                            <th>Longitude (°)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            
+            // Add rows of data
+            const maxRows = Math.min(20, groundTrackResults.propagation_data.times.length);
+            for (let i = 0; i < maxRows; i++) {
+                html += `
+                    <tr>
+                        <td>${new Date(groundTrackResults.propagation_data.times[i]).toLocaleString()}</td>
+                        <td>${groundTrackResults.propagation_data.latitudes[i].toFixed(4)}</td>
+                        <td>${groundTrackResults.propagation_data.longitudes[i].toFixed(4)}</td>
+                    </tr>
+                `;
+            }
+            
+            html += `
+                    </tbody>
+                </table>
+                <div style="margin-top: 15px; color: #69f0ae;">
+                    Showing ${maxRows} of ${groundTrackResults.propagation_data.times.length} points.
+                </div>
+            `;
+            
+            dataContainer.innerHTML = html;
+            
+            // Show the ground track modal
+            document.getElementById('ground-track-modal').style.display = 'block';
+        }
+        
+        // Function to switch tabs
+        function switchTab(tabId) {
+            // Hide all tab contents
+            const tabContents = document.querySelectorAll('.tab-content');
+            tabContents.forEach(tab => tab.classList.remove('active'));
+            
+            // Deactivate all tabs
+            const tabs = document.querySelectorAll('.modal-tab');
+            tabs.forEach(tab => tab.classList.remove('active'));
+            
+            // Activate the selected tab
+            document.getElementById(tabId).classList.add('active');
+            
+            // Activate the tab button
+            const tabIndex = tabId === 'map-tab' ? 0 : 1;
+            tabs[tabIndex].classList.add('active');
         }
 
         // Initialize the page
